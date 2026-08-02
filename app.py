@@ -1,0 +1,502 @@
+"""
+================================================================================
+  S Keystrokes  —  Chronos Keystrokes & Performance HUD (v1.1 "Glass")
+================================================================================
+
+A compact, glassmorphism-style, always-on-top overlay that shows:
+  - W / A / S / D key state
+  - Left Mouse Button (LMB) / Right Mouse Button (RMB) state
+  - SPACE bar state
+  - Live FPS of the overlay's own render loop
+  - Live Left-Click CPS (Clicks Per Second, 1-second rolling window)
+
+--------------------------------------------------------------------------------
+INSTALLATION
+--------------------------------------------------------------------------------
+    pip install customtkinter pynput
+
+(Windows + `pip` not recognized? Try:  py -m pip install customtkinter pynput)
+
+--------------------------------------------------------------------------------
+RUNNING
+--------------------------------------------------------------------------------
+    python s_keystrokes.py
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+- Display-only overlay: it never logs, saves, or transmits keystrokes anywhere.
+  It just mirrors the live pressed/released state of W, A, S, D, SPACE, LMB,
+  RMB on screen for visual feedback while gaming/streaming.
+- On Windows 10/11 this build tries to enable real acrylic/blur-behind glass
+  (via the undocumented DWM composition API). If that's unavailable (macOS,
+  Linux, or an older Windows build) it automatically falls back to a tinted
+  semi-transparent "glass" look using window alpha instead — same visual
+  language, just without the live blur.
+- Right-click anywhere on the HUD (or tap the ⚙) to open the scale menu.
+- Drag the thin top strip to move the HUD.
+================================================================================
+"""
+
+import sys
+import time
+import ctypes
+import threading
+import collections
+
+import customtkinter as ctk
+from pynput import keyboard, mouse
+
+# ------------------------------------------------------------------------------
+# Appearance setup
+# ------------------------------------------------------------------------------
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("dark-blue")
+
+# ---- "Glass" palette ---------------------------------------------------------
+# Everything is a dark, desaturated, semi-transparent-*feeling* tone so it
+# reads as frosted glass rather than a flat dark panel.
+GLASS_BG        = "#14161c"    # base glass tint (also the window transparentcolor on Windows)
+GLASS_PANEL     = "#1b1e26"    # inner card tint
+GLASS_BORDER    = "#33384a"    # hairline border, like light catching glass edge
+KEY_IDLE_FILL   = "#1c1f28"
+KEY_IDLE_BORDER = "#363c4d"
+KEY_IDLE_TEXT   = "#9aa3b8"
+
+ACCENT          = "#5ef7ff"    # neon cyan
+ACCENT_SOFT     = "#1e5a5e"    # muted glow ring behind active key
+ACCENT_TEXT     = "#04181a"
+
+STAT_ACCENT     = "#8de3ff"
+
+# ------------------------------------------------------------------------------
+# Scale presets — deliberately tighter/smaller than a "normal" desktop widget
+# so the HUD stays out of the way of gameplay. (btn, font, gap, radius, space_h)
+# ------------------------------------------------------------------------------
+SCALE_PRESETS = {
+    "Small":  {"btn": 28, "font": 10, "gap": 3, "radius": 8,  "space_h": 18, "glow": 2},
+    "Medium": {"btn": 38, "font": 12, "gap": 4, "radius": 10, "space_h": 24, "glow": 3},
+    "Large":  {"btn": 50, "font": 14, "gap": 5, "radius": 13, "space_h": 30, "glow": 4},
+}
+
+
+# ==================================================================
+# Windows acrylic / blur-behind helper
+# ==================================================================
+def try_enable_windows_acrylic(hwnd: int) -> bool:
+    """Best-effort attempt to turn on real live blur-behind glass on
+    Windows 10/11 using the undocumented SetWindowCompositionAttribute
+    API. Silently returns False on any failure (wrong OS, API missing,
+    driver doesn't support it, etc.) so the app can fall back gracefully."""
+    if sys.platform != "win32":
+        return False
+    try:
+        class ACCENT_POLICY(ctypes.Structure):
+            _fields_ = [
+                ("AccentState", ctypes.c_int),
+                ("AccentFlags", ctypes.c_int),
+                ("GradientColor", ctypes.c_uint),
+                ("AnimationId", ctypes.c_int),
+            ]
+
+        class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
+            _fields_ = [
+                ("Attribute", ctypes.c_int),
+                ("Data", ctypes.POINTER(ACCENT_POLICY)),
+                ("SizeOfData", ctypes.c_size_t),
+            ]
+
+        ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+        WCA_ACCENT_POLICY = 19
+
+        # ABGR gradient color: low alpha (0x33) tinted with our glass color
+        gradient_color = 0x33221614  # AABBGGRR-ish packing accepted by the API
+
+        accent = ACCENT_POLICY()
+        accent.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND
+        accent.AccentFlags = 2
+        accent.GradientColor = gradient_color
+        accent.AnimationId = 0
+
+        data = WINDOWCOMPOSITIONATTRIBDATA()
+        data.Attribute = WCA_ACCENT_POLICY
+        data.Data = ctypes.pointer(accent)
+        data.SizeOfData = ctypes.sizeof(accent)
+
+        set_attr = ctypes.windll.user32.SetWindowCompositionAttribute
+        set_attr(ctypes.c_void_p(hwnd), ctypes.pointer(data))
+        return True
+    except Exception:
+        return False
+
+
+class KeyButton(ctk.CTkFrame):
+    """A compact glass-style key/mouse indicator.
+
+    Built from a frame (soft outer glow ring) wrapping a label, rather than
+    a plain CTkButton, so the "press glow" can look like a soft halo instead
+    of a hard color swap — closer to the frosted-glass aesthetic.
+    """
+
+    def __init__(self, master, label, radius, glow, **kwargs):
+        super().__init__(
+            master,
+            fg_color=KEY_IDLE_FILL,
+            border_width=1,
+            border_color=KEY_IDLE_BORDER,
+            corner_radius=radius,
+            **kwargs,
+        )
+        self.grid_propagate(False)
+        self._glow = glow
+        self._active = False
+
+        self.lbl = ctk.CTkLabel(self, text=label, text_color=KEY_IDLE_TEXT)
+        self.lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+    def set_font(self, font):
+        self.lbl.configure(font=font)
+
+    def set_active(self, active: bool):
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            self.configure(fg_color=ACCENT_SOFT, border_color=ACCENT,
+                            border_width=self._glow)
+            self.lbl.configure(text_color=ACCENT)
+        else:
+            self.configure(fg_color=KEY_IDLE_FILL, border_color=KEY_IDLE_BORDER,
+                            border_width=1)
+            self.lbl.configure(text_color=KEY_IDLE_TEXT)
+
+
+class ChronosHUD(ctk.CTk):
+    """Main application window: compact glass-style keystroke HUD."""
+
+    def __init__(self):
+        super().__init__(fg_color=GLASS_BG)
+
+        self.title("S Keystrokes")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+
+        # Base transparency. On Windows this is layered on top of the
+        # acrylic blur-behind (if it initializes) for a true frosted look;
+        # elsewhere it's the whole glass effect by itself.
+        self.wm_attributes("-alpha", 0.88)
+
+        self._acrylic_enabled = False
+
+        # ---- state -------------------------------------------------------
+        self.current_scale = "Small"
+        self._pressed_keys = set()
+        self._mouse_state = {"left": False, "right": False}
+
+        self._click_times = collections.deque()
+        self._click_lock = threading.Lock()
+
+        self._last_frame_time = time.perf_counter()
+        self._fps_value = 0.0
+        self._fps_smooth_alpha = 0.15
+
+        # ---- build UI ------------------------------------------------------
+        self._build_ui()
+        self._apply_scale(self.current_scale)
+
+        # try real acrylic glass on Windows once the window handle exists
+        self.after(50, self._init_acrylic)
+
+        # ---- global input listeners -----------------------------------
+        self._kb_listener = keyboard.Listener(
+            on_press=self._on_key_press, on_release=self._on_key_release
+        )
+        self._mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
+        self._kb_listener.start()
+        self._mouse_listener.start()
+
+        # ---- dragging -------------------------------------------------
+        self._drag_offset = (0, 0)
+        self.drag_bar.bind("<ButtonPress-1>", self._start_drag)
+        self.drag_bar.bind("<B1-Motion>", self._do_drag)
+
+        # ---- right-click menu -------------------------------------------
+        self.bind("<Button-3>", self._show_scale_menu)
+        self.drag_bar.bind("<Button-3>", self._show_scale_menu)
+        self.bind("<Escape>", lambda e: self._on_close())
+
+        # ---- update loops (non-blocking, cooperative via .after) -------
+        self.after(16, self._render_tick)
+        self.after(200, self._stats_tick)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ==================================================================
+    # ACRYLIC INIT
+    # ==================================================================
+    def _init_acrylic(self):
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            self._acrylic_enabled = try_enable_windows_acrylic(hwnd)
+        except Exception:
+            self._acrylic_enabled = False
+        if self._acrylic_enabled:
+            # blur is doing the "glass" work now, so let colors stay a touch
+            # more transparent-looking without needing max window alpha
+            self.wm_attributes("-alpha", 0.92)
+
+    # ==================================================================
+    # UI CONSTRUCTION
+    # ==================================================================
+    def _build_ui(self):
+        self.container = ctk.CTkFrame(
+            self, fg_color=GLASS_PANEL, corner_radius=14,
+            border_width=1, border_color=GLASS_BORDER,
+        )
+        self.container.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # thin draggable header strip
+        self.drag_bar = ctk.CTkFrame(self.container, fg_color="transparent", height=16)
+        self.drag_bar.pack(fill="x", padx=5, pady=(3, 0))
+
+        self.title_label = ctk.CTkLabel(
+            self.drag_bar, text="S · KEYSTROKES", text_color="#5b6274",
+            font=ctk.CTkFont(size=9, weight="bold")
+        )
+        self.title_label.pack(side="left")
+
+        self.gear_btn = ctk.CTkButton(
+            self.drag_bar, text="⚙", width=16, height=16, fg_color="transparent",
+            hover_color="#242833", text_color="#6b7186", font=ctk.CTkFont(size=10),
+            command=self._show_scale_menu
+        )
+        self.gear_btn.pack(side="right")
+
+        self.close_btn = ctk.CTkButton(
+            self.drag_bar, text="✕", width=16, height=16, fg_color="transparent",
+            hover_color="#3a1c22", text_color="#6b7186", font=ctk.CTkFont(size=10),
+            command=self._on_close
+        )
+        self.close_btn.pack(side="right", padx=(0, 3))
+
+        # main content grid
+        self.grid_frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        self.grid_frame.pack(padx=7, pady=5)
+
+        self.row1 = ctk.CTkFrame(self.grid_frame, fg_color="transparent")
+        self.row1.pack()
+
+        self.row2 = ctk.CTkFrame(self.grid_frame, fg_color="transparent")
+        self.row2.pack()
+
+        self.row3 = ctk.CTkFrame(self.grid_frame, fg_color="transparent")
+        self.row3.pack()
+
+        self.row4 = ctk.CTkFrame(self.grid_frame, fg_color="transparent")
+        self.row4.pack()
+
+        self.row5 = ctk.CTkFrame(self.grid_frame, fg_color="transparent")
+        self.row5.pack(pady=(3, 1))
+
+        self.fps_label = ctk.CTkLabel(self.row5, text="FPS 0", text_color=STAT_ACCENT)
+        self.cps_label = ctk.CTkLabel(self.row5, text="CPS 0", text_color=STAT_ACCENT)
+        self.fps_label.pack(side="left", padx=5)
+        self.cps_label.pack(side="left", padx=5)
+
+        # key widgets are (re)built inside _apply_scale so their fixed pixel
+        # size and radius can change cleanly between presets
+        self.btn_w = self.btn_a = self.btn_s = self.btn_d = None
+        self.btn_lmb = self.btn_rmb = self.btn_space = None
+
+    # ==================================================================
+    # SCALE / PRESET HANDLING
+    # ==================================================================
+    def _show_scale_menu(self, event=None):
+        menu = ctk.CTkToplevel(self)
+        menu.overrideredirect(True)
+        menu.attributes("-topmost", True)
+        menu.wm_attributes("-alpha", 0.95)
+        menu.configure(fg_color=GLASS_PANEL)
+
+        x = self.winfo_pointerx()
+        y = self.winfo_pointery()
+        menu.geometry(f"104x96+{x}+{y}")
+
+        ctk.CTkLabel(menu, text="HUD Scale", text_color="#7a8199",
+                     font=ctk.CTkFont(size=10, weight="bold")).pack(pady=(6, 2))
+
+        for name in SCALE_PRESETS:
+            b = ctk.CTkButton(
+                menu, text=name, height=22, corner_radius=6,
+                fg_color=(ACCENT_SOFT if name == self.current_scale else "#20242e"),
+                hover_color="#245c60",
+                text_color=(ACCENT if name == self.current_scale else "#c7ccd8"),
+                font=ctk.CTkFont(size=11),
+                command=lambda n=name, m=menu: self._select_scale(n, m)
+            )
+            b.pack(fill="x", padx=7, pady=2)
+
+        menu.bind("<FocusOut>", lambda e: menu.destroy())
+        menu.after(50, menu.focus_force)
+
+    def _select_scale(self, name, menu_window):
+        menu_window.destroy()
+        self._apply_scale(name)
+
+    def _apply_scale(self, name):
+        """Rebuild key indicators at the new size/radius/glow, then
+        re-fit the window. Rebuilding (rather than just resizing) keeps
+        the glow ring proportions crisp at every scale."""
+        preset = SCALE_PRESETS[name]
+        self.current_scale = name
+        btn = preset["btn"]
+        gap = preset["gap"]
+        radius = preset["radius"]
+        space_h = preset["space_h"]
+        glow = preset["glow"]
+        font = ctk.CTkFont(size=preset["font"], weight="bold")
+        small_font = ctk.CTkFont(size=max(8, preset["font"] - 3), weight="bold")
+        stat_font = ctk.CTkFont(size=max(9, preset["font"] - 2), weight="bold")
+
+        # tear down old key widgets if this is a re-scale, not first build
+        for w in (self.btn_w, self.btn_a, self.btn_s, self.btn_d,
+                  self.btn_lmb, self.btn_rmb, self.btn_space):
+            if w is not None:
+                w.destroy()
+
+        # Row 1: W
+        self.btn_w = KeyButton(self.row1, "W", radius, glow, width=btn, height=btn)
+        self.btn_w.set_font(font)
+        self.btn_w.pack(padx=gap, pady=gap)
+
+        # Row 2: A S D
+        self.btn_a = KeyButton(self.row2, "A", radius, glow, width=btn, height=btn)
+        self.btn_s = KeyButton(self.row2, "S", radius, glow, width=btn, height=btn)
+        self.btn_d = KeyButton(self.row2, "D", radius, glow, width=btn, height=btn)
+        for b in (self.btn_a, self.btn_s, self.btn_d):
+            b.set_font(font)
+            b.pack(side="left", padx=gap, pady=gap)
+
+        # Row 3: LMB RMB (slightly wider than tall)
+        mw, mh = int(btn * 1.15), int(btn * 0.72)
+        self.btn_lmb = KeyButton(self.row3, "LMB", radius, glow, width=mw, height=mh)
+        self.btn_rmb = KeyButton(self.row3, "RMB", radius, glow, width=mw, height=mh)
+        for b in (self.btn_lmb, self.btn_rmb):
+            b.set_font(small_font)
+            b.pack(side="left", padx=gap, pady=gap)
+
+        # Row 4: SPACE strip
+        space_width = btn * 3 + gap * 2
+        self.btn_space = KeyButton(self.row4, "SPACE", radius, glow,
+                                    width=space_width, height=space_h)
+        self.btn_space.set_font(small_font)
+        self.btn_space.pack(padx=gap, pady=gap)
+
+        self.fps_label.configure(font=stat_font)
+        self.cps_label.configure(font=stat_font)
+
+        self.after(10, self._fit_window)
+
+    def _fit_window(self):
+        self.update_idletasks()
+        w = self.container.winfo_reqwidth() + 4
+        h = self.container.winfo_reqheight() + 4
+        self.geometry(f"{w}x{h}")
+
+    # ==================================================================
+    # DRAGGING
+    # ==================================================================
+    def _start_drag(self, event):
+        self._drag_offset = (event.x, event.y)
+
+    def _do_drag(self, event):
+        x = self.winfo_pointerx() - self._drag_offset[0]
+        y = self.winfo_pointery() - self._drag_offset[1]
+        self.geometry(f"+{x}+{y}")
+
+    # ==================================================================
+    # GLOBAL INPUT CALLBACKS — run on pynput background threads, only
+    # ever flip lightweight flags. No UI work here, so the game/render
+    # loop underneath is never blocked.
+    # ==================================================================
+    def _on_key_press(self, key):
+        try:
+            k = key.char.lower() if hasattr(key, "char") and key.char else None
+        except Exception:
+            k = None
+        if k in ("w", "a", "s", "d"):
+            self._pressed_keys.add(k)
+        elif key == keyboard.Key.space:
+            self._pressed_keys.add("space")
+
+    def _on_key_release(self, key):
+        try:
+            k = key.char.lower() if hasattr(key, "char") and key.char else None
+        except Exception:
+            k = None
+        if k in ("w", "a", "s", "d"):
+            self._pressed_keys.discard(k)
+        elif key == keyboard.Key.space:
+            self._pressed_keys.discard("space")
+
+    def _on_mouse_click(self, x, y, button, pressed):
+        if button == mouse.Button.left:
+            self._mouse_state["left"] = pressed
+            if pressed:
+                with self._click_lock:
+                    self._click_times.append(time.perf_counter())
+        elif button == mouse.Button.right:
+            self._mouse_state["right"] = pressed
+
+    # ==================================================================
+    # UI UPDATE LOOPS
+    # ==================================================================
+    def _render_tick(self):
+        now = time.perf_counter()
+        dt = now - self._last_frame_time
+        self._last_frame_time = now
+        if dt > 0:
+            instant_fps = 1.0 / dt
+            self._fps_value = (self._fps_smooth_alpha * instant_fps +
+                                (1 - self._fps_smooth_alpha) * self._fps_value)
+
+        self.btn_w.set_active("w" in self._pressed_keys)
+        self.btn_a.set_active("a" in self._pressed_keys)
+        self.btn_s.set_active("s" in self._pressed_keys)
+        self.btn_d.set_active("d" in self._pressed_keys)
+        self.btn_space.set_active("space" in self._pressed_keys)
+        self.btn_lmb.set_active(self._mouse_state["left"])
+        self.btn_rmb.set_active(self._mouse_state["right"])
+
+        self.after(16, self._render_tick)
+
+    def _stats_tick(self):
+        now = time.perf_counter()
+        with self._click_lock:
+            while self._click_times and now - self._click_times[0] > 1.0:
+                self._click_times.popleft()
+            cps = len(self._click_times)
+
+        self.fps_label.configure(text=f"FPS {int(round(self._fps_value))}")
+        self.cps_label.configure(text=f"CPS {cps}")
+
+        self.after(200, self._stats_tick)
+
+    # ==================================================================
+    # SHUTDOWN
+    # ==================================================================
+    def _on_close(self):
+        try:
+            self._kb_listener.stop()
+            self._mouse_listener.stop()
+        except Exception:
+            pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = ChronosHUD()
+    app.update_idletasks()
+    sw = app.winfo_screenwidth()
+    app.geometry(f"+{sw - 220}+30")
+    app.mainloop()
